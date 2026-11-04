@@ -1,0 +1,44 @@
+# Scans the locked dependencies for known vulnerabilities and fails if any are
+# found. Dependabot (see .github/dependabot.yml) proposes upgrades but does not
+# block a merge, so this is what actually gates.
+
+name: Dependency Audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, so an advisory published against an unchanged dependency is still
+    # caught. Note GitHub disables scheduled workflows in forked repositories by
+    # default, so this may need enabling; the pull_request trigger above is the
+    # path that is guaranteed to run.
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UV_FROZEN: "1"
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v10.1.0
+      with:
+        enable-cache: true
+        cache-dependency-glob: "uv.lock"
+
+    # Auditing the export rather than the manifest means the exact pinned
+    # versions are checked, not whatever the declared ranges happen to allow.
+    - name: Audit locked dependencies
+      run: |
+        uv export --frozen --all-groups --no-emit-project --no-hashes \
+          -o "${{ runner.temp }}/requirements-audit.txt"
+        uvx pip-audit -r "${{ runner.temp }}/requirements-audit.txt"

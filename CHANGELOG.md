@@ -7,10 +7,243 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-## [v0.1](https://biogit.pri.bms.com/NGS/cwl_platform/releases/tag/v0.1) - 2024-03-21
+## [v0.6.1](https://github.com/NGS360/PAML/releases/tag/v0.6.1) - 2026-09-21
 
-## [v0.0.1](https://biogit.pri.bms.com/NGS/cwl_platform/releases/tag/v0.0.1) - 2024-02-28
+### Changed
+
+- Merge pull request #166 from NGS360/bug-arvados-get-task-output-scalar
+- Merge pull request #167 from NGS360/paml-get-tasks-by-name-filter-by-workflow
+- Merge pull request #164 from NGS360/refactor/release-script-git-helpers
+- Merge pull request #163 from NGS360/docs/license-text
+- Merge pull request #162 from NGS360/fix/release-notes-noise
+
+
+## [v0.6.0](https://github.com/NGS360/PAML/releases/tag/v0.6.0) - 2026-08-28
 
 ### Added
 
-- Converted to installable python package
+- `cwl_platform.__version__`, reporting the version of the installed package (PR #153)
+- `submit_task()` on NGS360 forwards `networkingMode` and `configurationName` as
+  WES workflow engine parameters, alongside the four it already forwarded (PR #129)
+
+### Changed
+
+- Support `smart_open` 8.x and `chardet` 7.x (PRs #151, #152)
+- Runtime dependencies now declare explicit floors and ceilings, where `chardet`
+  and `smart_open` previously had neither: `chardet>=5.2.0,<8.0`,
+  `smart_open>=7.1.0,<9.0`, `sevenbridges-python>=2.11.2,<3.0` (PRs #133, #151,
+  #152). An environment holding an older `chardet` or `smart_open` will no longer
+  satisfy the requirements.
+- `chardet` 7 ships compiled platform wheels rather than a pure-Python wheel, so
+  a platform without a prebuilt wheel now needs a compiler to install (PR #152)
+- The package version is derived from the git tag rather than declared in
+  `pyproject.toml`, and the build backend moved from setuptools to hatchling
+  (PR #153)
+- Dependencies are managed with `uv` and a committed `uv.lock`;
+  `requirements.txt` and `requirements-dev.txt` have been removed (PR #149)
+- Development and release tooling: quality gates that block on failure, a
+  dependency vulnerability audit, and a pull-request-based release flow
+  (PRs #133, #142, #143, #155, #160)
+
+### Fixed
+
+- `submit_task()` on NGS360 no longer writes a `<project>-<name>.parameters.json`
+  file into the caller's working directory (PR #154)
+- Arvados file copies call `smart_open.open()`; the `smart_open.smart_open()`
+  alias they previously used was removed in smart_open 8 and would have raised
+  `AttributeError` (PR #159)
+- `submit_task()` on NGS360 writes its request payload as UTF-8 rather than the
+  platform's locale encoding, and no longer swallows `KeyboardInterrupt` through
+  a bare `except` (PR #133)
+- `get_task_cost()` on SevenBridges logs why a cost could not be read instead of
+  silently returning 0.0 (PR #133)
+- `execution_settings` is documented accurately on every platform. It was
+  described as unused on NGS360 and as a lone `use_spot_instance` flag on the
+  base class, while Arvados also reads `priority` (PR #154)
+
+
+## [v0.5.3](https://github.com/NGS360/PAML/releases/tag/v0.5.3) - 2026-07-27
+
+### Changed
+
+- Merge pull request #128 from NGS360/bugfix/sbg_compare_platform_object_directory
+
+## [v0.5.2](https://github.com/NGS360/PAML/releases/tag/v0.5.2) - 2026-07-27
+
+### Changed
+
+- Updating min python version to 3.10 and bumping package revision
+- Merge pull request #126 from NGS360/bugfix/resolve_detect_connect_return_values
+- Merge pull request #124 from NGS360/claude-improve-release-process
+
+
+## [v0.5.1](https://github.com/NGS360/PAML/releases/tag/v0.5.1) - 2026-07-03
+
+### Changed
+
+- Merge pull request #123 from NGS360/bugfix/get_tasks_by_name
+
+
+## [v0.5](https://github.com/NGS360/PAML/releases/tag/v0.5) - 2026-07-01
+
+### Added
+
+- Add `copy_file()` and `get_current_user()` abstract methods to Platform base class (PR #116)
+- Add `intermediate-output-ttl` support for arvados-cwl-runner (PR #115)
+- Add GA4GH WES API platform support (PR #110)
+
+### Changed
+
+- Consolidate GA4GH WES and NGS360 API to use NGS360 auth token (PR #118)
+- Rename `api_endpoint` variable to `ga4gh_api_endpoint` for clarity (PR #117)
+- Check inputs when submitting tasks via `get_tasks_by_name()` and improve error logging (PR #110)
+- Update arvados-python-client requirement to >=3.2.1, <3.3.0 (PR #120)
+- Update setuptools requirement to >=82.0.1 (PR #109)
+
+### Fixed
+
+- Handle missing output files when list of files is returned in Arvados (PR #111)
+- Fix `get_files()` filter logic in Arvados to avoid duplicate results and return correct nested paths (PR #116)
+- Fix `upload_file()` for root path in SevenBridges (PR #116)
+- Fix `_list_files_in_folder()` when path resolves to root in SevenBridges (PR #116)
+- Check if username/password is not None before using for credentials (PR #114)
+
+## [v0.4](https://github.com/NGS360/PAML/releases/tag/v0.4) - 2026-04-10
+
+### Added
+
+- get_tasks_by_name now supports filtering tasks by workflow
+
+## [v0.3.4](https://github.com/NGS360/PAML/releases/tag/v0.3.4) - 2025-11-19
+
+### Fixed
+
+- Add check for container_uuid when called get_tasks_by_name.
+- Fix copy_folder to handle directories better in Arvados and only copy the specified folder instead of the whole collection.
+
+## [v0.3.3](https://github.com/NGS360/PAML/releases/tag/v0.3.3) - 2025-10-28
+
+### Fixed
+
+- Address issue where a newly created task was added to the task list. submit_task was returning a task without a name in Arvados (PR #91)
+- Fix incorrect type hint for Arvados in get_task_by_name (PR #96)
+- Fix get_task_state for Arvados not properly checking container request status (PR #97)
+
+## [v0.3.2](https://github.com/NGS360/PAML/releases/tag/v0.3.2) - 2025-07-12
+
+### Fixed
+
+- ArvadosPlatform::get_tasks_by_name was not properly handling list of tasks provided
+
+## [v0.3.1](https://github.com/NGS360/PAML/releases/tag/v0.3.1) - 2025-06-09
+
+### Added
+
+- get_tasks_by_name can now return all tasks in a project, to assist with caching
+
+### Changed
+
+- Update Arvados Python Client requirement to use >=3.0.0 and <3.2.0
+
+## [v0.3](https://github.com/NGS360/PAML/releases/tag/v0.3) - 2025-06-02
+
+### Added
+
+- Added get_costs method
+- Added get_projects method
+
+### Changed
+
+- Update Arvados Python Client to 3.1.1
+- get_task_by_name now checks for equilevant input values 
+- Remove SevenBridges Endpoint and make that a parameter to connect()
+- Update get_task_input to handle list of files
+- Resolve failing SBG integration test
+
+## [v0.2.5](https://github.com/NGS360/PAML/releases/tag/v0.2.5) - 2025-03-11
+
+### Added
+
+- Added get_files() method along with associated integration tests
+- Added various other method to support project loading/exporting including:
+    add_user_to_project()
+    delete_project_by_name()
+    get_workflows()
+    get_project_users()
+
+### Changed
+
+- Remove support for Python 3.8 and Python 3.13, so only supporting 3.9 - 3.12
+- Rename upload_file_to_project to upload_file
+
+### Fixed
+
+- Fixed get_user method to ignore case sensitivity
+
+## [v0.2.4](https://github.com/NGS360/PAML/releases/tag/v0.2.4) - 2025-02-14
+
+- Fix get_task_output for optional fields when queried in Arvados
+
+## [v0.2.3](https://github.com/NGS360/PAML/releases/tag/v0.2.3) - 2025-02-12
+
+- Fix removal of collection.all_files() from Arvados Python SDK.
+
+## [v0.2.2](https://github.com/NGS360/PAML/releases/tag/v0.2.2) - 2025-01-27
+
+- Downgraded support for arvados-python to 2.7.4
+
+## [v0.3-rc3](https://github.com/NGS360/PAML/releases/tag/v0.3-rc3) - 2024-12-16
+
+### Changed
+
+- Update support Python version >= 3.9
+
+## [v0.3-rc2](https://github.com/NGS360/PAML/releases/tag/v0.3-rc2) - 2024-12-16
+
+### Changed
+
+- Update support Python version >= 3.11
+
+## [v0.3-rc1](https://github.com/NGS360/PAML/releases/tag/v0.3-rc1) - 2024-12-16
+
+### Added
+
+- Add create_project method
+- Add get_user method
+- Various unit tests
+
+### Changed
+
+- Update support Python version to 3.13
+- Update version of arvados-python to 3.0
+
+### Fixed
+
+- Rename parameter executing_settings to execution_settings in submit_task
+- Addressed various pylint issues
+- Handle list outputs in CWL workflows
+- Check Arvados Outputs collection for cwl output prior to accessing
+
+## [v0.2.1](https://github.com/NGS360/PAML/releases/tag/v0.2.1) - 2024-10-21
+
+### Fixed
+
+- Catch SevenBridges exception when creating invalid task
+
+## [v0.2](https://github.com/NGS360/PAML/releases/tag/v0.2) - 2024-06-14
+
+### Added
+
+- get_task_outputs method
+- rename_output_files
+- roll_file method
+
+### Fixed
+
+- Fixed bug in how project is retrieved from SevenBridges
+
+## [v0.1.1](https://github.com/NGS360/PAML/releases/tag/v0.1.1) - 2024-04-09
+
+### Fixed
+
+- Fixed how we iterate files in a SevenBridges project

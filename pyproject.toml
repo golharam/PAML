@@ -1,29 +1,119 @@
 [project]
 name = "cwl_platform"
-version = "0.1"
+# Derived from the git tag by hatch-vcs, so the tag is the single source of
+# truth and there is no version to hand-edit. Between tags this resolves to a
+# .devN version; on a tag it resolves to the tag itself.
+dynamic = ["version"]
 authors = [
-  { name="Ryan Golhar", email="ryan.golhar@bms.com" },
-  { name="Maggie Chen", email="yu.chen2@bms.com" }
+  { name="Ryan Golhar", email="ngsbioinformatics@gmail.com" }
 ]
 description = "Multi-Platform Launcher Template"
 readme = "README.md"
-license = {file = "LICENSE"}
-requires-python = ">=3.8"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
-dynamic = ["dependencies"]
 
-[tool.setuptools.dynamic]
-dependencies = {file = ["requirements.txt"]}
+# Published as the package's install_requires, so these use lower bounds (the
+# version we test against) plus an upper bound at the next incompatible release.
+# Never exact '==' pins, which would force version conflicts on anything that
+# depends on cwl_platform.
+dependencies = [
+    "chardet>=5.2.0,<8.0",
+    "smart_open>=7.1.0,<9.0",
+    # arvados-python-client tracks the Arvados API version and can break between
+    # minor releases, so it is bounded more tightly than the others.
+    "arvados-python-client>=3.2.1,<3.3.0",
+    "sevenbridges-python>=2.11.2,<3.0",
+]
+
+# Development dependencies (PEP 735). Not published as package metadata, so they
+# are bounded tightly to keep local and CI runs reproducible. Exact versions come
+# from uv.lock; these bounds express intent.
+[dependency-groups]
+dev = [
+    # Used by the release workflow to validate built artifacts before publishing.
+    "twine>=7.0.0,<8.0",
+    # Lower bound is a security floor, not just a tested version: pytest through
+    # 9.0.2 has predictable /tmp/pytest-of-{user} handling (CVE-2025-71176),
+    # fixed in 9.0.3.
+    "pytest>=9.0.3,<10.0",
+    "pytest-cov>=7.1.0,<8.0",
+    # Invoked directly by the test workflow ('coverage run' / 'coverage report'),
+    # so it is declared rather than relied on transitively via pytest-cov.
+    "coverage>=7.13.5,<8.0",
+    "mock>=5.2.0,<6.0",
+    # Imported directly by scripts/release_notes.py and prepare_changelog.py.
+    # Previously arrived transitively via 'build', which is no longer needed now
+    # that 'uv build' does the packaging.
+    "packaging>=26.0,<27.0",
+    # The exact version comes from uv.lock; this bound is only a coarse guard.
+    # pylint introduces new checks in minor releases (R0917 arrived in 3.3),
+    # which can turn 'make lint' red with no code change, so an upgrade should
+    # arrive as a reviewed Dependabot pull request rather than an incidental
+    # re-resolve.
+    "pylint>=3.3.7,<4.2",
+]
 
 [project.urls]
 Homepage = "https://github.com/NGS360/PAML"
 Issues = "https://github.com/NGS360/PAML/issues"
 
 [build-system]
-requires = ["setuptools >= 61.0"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cwl_platform"]
+
+# Hatchling would otherwise sdist everything git does not ignore, which pulls in
+# .claude/, .github/ and the generated htmlcov/ report. Keep this to the sources
+# and packaging files, matching what the previous setuptools build shipped.
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/cwl_platform/",
+    "tests/",
+    "pyproject.toml",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+]
+
+# Pylint configuration lives here rather than in the 'make lint' command line so
+# that local runs and CI cannot drift apart.
+[tool.pylint.format]
+max-line-length = 120
+
+[tool.pylint.similarities]
+ignore-imports = true
+
+[tool.pylint."messages control"]
+disable = [
+    # Accepted structural debt. The platform adapters are deliberately large
+    # classes with wide signatures because they mirror the upstream SDK surfaces
+    # (Arvados, SevenBridges, GA4GH WES). Splitting them to satisfy these limits
+    # would fragment the API without making it clearer. Revisit if a module is
+    # refactored for other reasons.
+    "too-many-arguments",
+    "too-many-positional-arguments",
+    "too-many-locals",
+    "too-many-branches",
+    "too-many-return-statements",
+    "too-many-nested-blocks",
+    "too-many-public-methods",
+    "too-many-instance-attributes",
+    "too-few-public-methods",
+    "too-many-lines",
+    # Every platform implements the same Platform method surface, so
+    # near-identical blocks across adapters are expected by design.
+    "duplicate-code",
+    # Open work is tracked in GitHub issues, not enforced by the linter.
+    "fixme",
+]
 

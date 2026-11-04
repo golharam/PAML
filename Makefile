@@ -1,20 +1,18 @@
 all: test lint
 
 install_dependencies:
-	pip install --upgrade pip
-	pip install -r requirements.txt
-	pip install -r requirements-dev.txt
+	uv sync
 
 build:
-	python3 -m build
+	uv build
 
 install: build
-	python3 -m pip install --upgrade dist/*.whl
+	uv pip install --upgrade dist/*.whl
 
 test:
-	PYTHONPATH=src coverage run --source=src -m pytest
-	coverage report
-	coverage html
+	uv run coverage run --source=src -m pytest -v
+	uv run coverage report
+	uv run coverage html -d htmlcov
 
 lint:
-	pylint --max-line-length=120 --ignore-imports=y --exit-zero $$(git ls-files '*.py')
+	uv run pylint src tests scripts

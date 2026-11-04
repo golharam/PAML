@@ -5,9 +5,9 @@ Prepares markdown release notes for GitHub releases.
 """
 
 import os
-from typing import List, Optional
+from typing import List
 
-import packaging.version
+import release_utils
 
 TAG = os.environ["TAG"]
 
@@ -18,9 +18,12 @@ REMOVED_HEADER = "### Removed 👋"
 
 
 def get_change_log_notes() -> str:
+    '''
+    Read CHANGELOG.md
+    '''
     in_current_section = False
     current_section_notes: List[str] = []
-    with open("CHANGELOG.md") as changelog:
+    with open("CHANGELOG.md", encoding="utf-8") as changelog:
         for line in changelog:
             if line.startswith("## "):
                 if line.startswith("## Unreleased"):
@@ -39,44 +42,32 @@ def get_change_log_notes() -> str:
                 elif line.startswith("### Removed"):
                     line = REMOVED_HEADER + "\n"
                 current_section_notes.append(line)
-    assert current_section_notes
+    if not current_section_notes:
+        raise SystemExit(
+            f"ERROR: No release notes found for {TAG} in CHANGELOG.md.\n"
+            f"Expected a non-empty '## [{TAG}](...)' section listing the changes "
+            f"for this release."
+        )
     return "## What's new\n\n" + "".join(current_section_notes).strip() + "\n"
 
 
 def get_commit_history() -> str:
-    new_version = packaging.version.parse(TAG)
-
-    # Pull all tags.
-    os.popen("git fetch --tags")
-
-    # Get all tags sorted by version, latest first.
-    all_tags = os.popen("git tag -l --sort=-version:refname 'v*'").read().split("\n")
-
-    # Out of `all_tags`, find the latest previous version so that we can collect all
-    # commits between that version and the new version we're about to publish.
-    # Note that we ignore pre-releases unless the new version is also a pre-release.
-    last_tag: Optional[str] = None
-    for tag in all_tags:
-        if not tag.strip():  # could be blank line
-            continue
-        version = packaging.version.parse(tag)
-        if new_version.pre is None and version.pre is not None:
-            continue
-        if version < new_version:
-            last_tag = tag
-            break
-    if last_tag is not None:
-        commits = os.popen(f"git log {last_tag}..{TAG} --oneline --first-parent").read()
-    else:
-        commits = os.popen("git log --oneline --first-parent").read()
+    '''
+    get git commit history
+    '''
+    # release.sh validates these notes before creating the tag, so TAG may not
+    # resolve yet. HEAD is the commit that tag will point at, which makes the
+    # preview accurate instead of making git complain about an unknown revision.
+    end = TAG if release_utils.rev_exists(TAG) else "HEAD"
+    commits = release_utils.commit_log(release_utils.previous_tag(TAG), end)
     return "## Commits\n\n" + commits
 
 
 def main():
+    ''' main '''
     print(get_change_log_notes())
     print(get_commit_history())
 
 
 if __name__ == "__main__":
     main()
-

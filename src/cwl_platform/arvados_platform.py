@@ -1,18 +1,24 @@
 '''
 Arvados Platform class
 '''
+import collections
 import json
 import logging
 import os
+import pathlib
 import re
 import subprocess
 import tempfile
+from typing import List
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import chardet
 
 import googleapiclient
+import smart_open
 
 import arvados
+
 from .base_platform import Platform
 
 def open_file_with_inferred_encoding(filename, mode='r'):
@@ -25,9 +31,45 @@ def open_file_with_inferred_encoding(filename, mode='r'):
         raise ValueError("Failed to detect file encoding.")
     return open(filename, mode, encoding=encoding)
 
+def find_collection_file_path(keep_uri):
+    '''
+    This is a helper function that given a keep_uri, return the collection_uuid and file path
+    :param keep_uri: Keep URI (e.g. keep:asdf-asdf-asdf/some/file.txt)
+    return: [collection uuid, file path]
+    '''
+    if keep_uri.startswith('keep:'):
+        keep_uri = keep_uri[5:]
+    keep_components = keep_uri.split('/')
+    keep_uuid = keep_components[0]
+    file_path = ''
+    if len(keep_components) > 1:
+        file_path = '/'.join(keep_components[1:])
+    return keep_uuid, file_path
+
+# Query parameters that S3 adds when it presigns a URL (SigV2 and SigV4)
+PRESIGNED_URL_PARAMS = {'awsaccesskeyid', 'signature', 'expires', 'x-amz-security-token'}
+
+def _normalize_location(location):
+    '''
+    Drop the S3 presigning parameters from an http(s) location.
+    A presigned URL is signed again every time a project is loaded, so its
+    Expires/Signature change even though it names the same object.
+    Other locations (keep:, s3:, ...) and other query parameters are kept as-is.
+    :param location: File or Directory location
+    :return: The location without its signature
+    '''
+    if not isinstance(location, str) or not location.startswith(('http://', 'https://')):
+        return location
+    parts = urlsplit(location)
+    query = [
+        (key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if key.lower() not in PRESIGNED_URL_PARAMS and not key.lower().startswith('x-amz-')
+    ]
+    return urlunsplit(parts._replace(query=urlencode(query)))
+
 class ArvadosTask():
     '''
-    Arvados Task class to encapsulate task functionality to mimick SevenBrides task class
+    Arvados Task class to encapsulate task functionality to mimick SevenBridges task class
     '''
     def __init__(self, container_request, container):
         self.container_request = container_request
@@ -54,6 +96,24 @@ class ArvadosTaskEncoder(json.JSONEncoder):
             return o.to_dict()
         return super().default(o)
 
+class StreamFileReader(arvados.arvfile.ArvadosFileReader):
+    '''
+    This class replaces the deprecated StreamFileReader that existed in Arvados prior to 2.7.4
+    '''
+    class _NameAttribute(str):
+        # The Python file API provides a plain .name attribute.
+        # Older SDK provided a name() method.
+        # This class provides both, for maximum compatibility.
+        def __call__(self):
+            return self
+
+    def __init__(self, arvadosfile):
+        super().__init__(arvadosfile)
+        self.name = self._NameAttribute(arvadosfile.name)
+
+    def stream_name(self):
+        return super().stream_name().lstrip("./")
+
 # custom JSON decoder
 def arvados_task_decoder(obj):
     ''' Arvados Task Decoder class '''
@@ -70,18 +130,37 @@ class ArvadosPlatform(Platform):
         self.keep_client = None
         self.logger = logging.getLogger(__name__)
 
+    def _all_files(self, root_collection):
+        '''
+        all_files yields tuples of (collection path, file object) for
+        each file in the collection.
+        '''
+
+        stream_queue = collections.deque([pathlib.PurePosixPath('.')])
+        while stream_queue:
+            stream_path = stream_queue.popleft()
+            subcollection = root_collection.find(str(stream_path))
+            for name, item in subcollection.items():
+                if isinstance(item, arvados.arvfile.ArvadosFile):
+                    yield StreamFileReader(item)
+                else:
+                    stream_queue.append(stream_path / name)
+
     def _get_files_list_in_collection(self, collection_uuid, subdirectory_path=None):
         '''
-        Get list of files in collection, if subdirectory_path is provided, return only files in that subdirectory.
+        Get list of files in collection, if subdirectory_path is provided, return
+        only files in that subdirectory.
 
         :param collection_uuid: uuid of the collection
         :param subdirectory_path: subdirectory path to filter files in the collection
         :return: list of files in the collection
         '''
         the_col = arvados.collection.CollectionReader(manifest_locator_or_text=collection_uuid)
-        file_list = the_col.all_files()
+        file_list = self._all_files(the_col)
         if subdirectory_path:
-            return [fl for fl in file_list if os.path.basename(fl.stream_name()) == subdirectory_path]
+            return [fl for fl in file_list if (
+                os.path.basename(fl.stream_name()) == subdirectory_path
+                )]
         return list(file_list)
 
     def _load_cwl_output(self, task: ArvadosTask):
@@ -91,186 +170,267 @@ class ArvadosPlatform(Platform):
         cwl_output_collection = arvados.collection.Collection(task.container_request['output_uuid'],
                                                               api_client=self.api,
                                                               keep_client=self.keep_client)
+        if len(cwl_output_collection.items()) == 0:
+            return None
+
         cwl_output = None
         with cwl_output_collection.open('cwl.output.json') as cwl_output_file:
             cwl_output = json.load(cwl_output_file)
         return cwl_output
 
-    def connect(self, **kwargs):
-        ''' Connect to Arvados '''
-        self.api = arvados.api_from_config(version='v1', apiconfig=self.api_config)
-        self.keep_client = arvados.KeepClient(self.api)
-        self.connected = True
+    def _lookup_collection_from_foldername(self, project, folder):
+        '''
+        Give a folder path, return the corresponding collection in the project.
+        
+        :param project: The arvados project
+        :param folder: The "file path" of the folder e.g. /rootfolder or /rootfolder/subfolder
+        :return: Tuple of (collection object, subfolder path) or (None, None) if not found
+        '''
+        # 1. Split the folder path into collection_name and subfolder
+        # Handle whether or not a leading slash is included
+        if folder.startswith('/'):
+            folder = folder.lstrip('/')
+
+        # Split into parts
+        folder_parts = folder.split('/')
+        collection_name = folder_parts[0]
+
+        # Everything after the collection name is the subfolder
+        subfolder = '/'.join(folder_parts[1:]) if len(folder_parts) > 1 else ''
+
+        # 2. Look up the collection
+        search_result = self.api.collections().list(filters=[
+            ["owner_uuid", "=", project["uuid"]],
+            ["name", "=", collection_name]
+            ]).execute()
+        if len(search_result['items']) > 0:
+            self.logger.debug("Found source collection %s in project %s",
+                              collection_name, project["uuid"])
+            return search_result['items'][0], subfolder
+
+        self.logger.error("Source collection %s not found in project %s",
+                          collection_name, project["uuid"])
+        return None, None
+
+    # File methods
+    def copy_file(self, file, destination_project, file_path=None):
+        """
+        Copy a single file from one project to another.
+
+        For Arvados, 'file' is a keep URI string (e.g. keep:uuid/path/to/file).
+        This copies the file into a collection in the destination project.
+
+        :param file: The keep URI of the file to copy
+        :param destination_project: The destination project to copy the file to
+        :param file_path: Optional destination folder path in the destination project.
+            On Arvados, the first component of the path is used as the collection name.
+        :return: The keep URI of the copied file in the destination project
+        """
+        # Parse the source file keep URI
+        source_collection_uuid, source_file_path = find_collection_file_path(file)
+
+        # Determine the destination collection name from file_path or default to 'shared'
+        if file_path:
+            path_parts = file_path.strip('/').split('/')
+            collection_name = path_parts[0]
+        else:
+            collection_name = "shared"
+
+        # Find or create the destination collection in the destination project
+        search_result = self.api.collections().list(filters=[
+            ["owner_uuid", "=", destination_project["uuid"]],
+            ["name", "=", collection_name]
+        ]).execute()
+        if len(search_result['items']) > 0:
+            dest_collection = search_result['items'][0]
+        else:
+            dest_collection = self.api.collections().create(body={
+                "owner_uuid": destination_project["uuid"],
+                "name": collection_name
+            }).execute()
+
+        # Copy the file
+        source_collection = arvados.collection.Collection(source_collection_uuid, api_client=self.api)
+        target_collection = arvados.collection.Collection(dest_collection['uuid'], api_client=self.api)
+
+        target_path = os.path.basename(source_file_path) if source_file_path else ""
+        target_collection.copy(
+            source_file_path or ".",
+            target_path=target_path,
+            source_collection=source_collection
+        )
+        target_collection.save()
+
+        return f"keep:{dest_collection['uuid']}/{target_path}"
 
     def copy_folder(self, source_project, source_folder, destination_project):
         '''
         Copy folder to destination project
 
         :param source_project: The source project
-        :param source_folder: The source folder
+        :param source_folder: The source folder 
         :param destination_project: The destination project
         :return: The destination folder or None if not found
         '''
         self.logger.debug("Copying folder %s from project %s to project %s",
-                     source_folder, source_project["uuid"], destination_project["uuid"])
+                          source_folder, source_project["uuid"], destination_project["uuid"])
 
-        # 1. Get the source collection
-        # The first element of the source_folder path is the name of the collection.
-        if source_folder.startswith('/'):
-            collection_name = source_folder.split('/')[1]
-        else:
-            collection_name = source_folder.split('/')[0]
-
-        search_result = self.api.collections().list(filters=[
-            ["owner_uuid", "=", source_project["uuid"]],
-            ["name", "=", collection_name]
-            ]).execute()
-        if len(search_result['items']) > 0:
-            self.logger.debug("Found source collection %s in project %s", collection_name, source_project["uuid"])
-            source_collection = search_result['items'][0]
-        else:
-            self.logger.error("Source collection %s not found in project %s", collection_name, source_project["uuid"])
+        source_collection, subfolder = self._lookup_collection_from_foldername(
+            source_project, source_folder)
+        if not source_collection:
             return None
 
         # 2. Get the destination project collection
-        search_result = self.api.collections().list(filters=[
-            ["owner_uuid", "=", destination_project["uuid"]],
-            ["name", "=", collection_name]
-            ]).execute()
-        if len(search_result['items']) > 0:
-            self.logger.debug("Found destination folder %s in project %s", collection_name, destination_project["uuid"])
-            destination_collection = search_result['items'][0]
-        else:
-            self.logger.debug("Destination folder %s not found in project %s, creating",
-                              collection_name, destination_project["uuid"])
+        destination_collection, _ = self._lookup_collection_from_foldername(
+            destination_project, source_folder)
+        # If the destination collection does not exist, create it
+        if not destination_collection:
             destination_collection = self.api.collections().create(body={
                 "owner_uuid": destination_project["uuid"],
-                "name": collection_name,
+                "name": source_collection['name'],
                 "description": source_collection["description"],
-                "preserve_version":True}).execute()
+                "preserve_version": True}).execute()
 
         # Copy the files from the reference project to the destination project
         self.logger.debug("Get list of files in source collection, %s", source_collection["uuid"])
-        source_files = self._get_files_list_in_collection(source_collection["uuid"])
-        self.logger.debug("Getting list of files in destination collection, %s", destination_collection["uuid"])
-        destination_files = list(self._get_files_list_in_collection(destination_collection["uuid"]))
+        # The subfolder is now extracted from _lookup_collection_from_foldername
+        # subfolder can be:
+        # '' (empty - root of collection)
+        # 'GRCh38ERCC.ensembl91.star-2.6.0c-index-archive'
+        # 'GRCh38ERCC.ensembl91.star-2.6.0c-index-archive/athirdlevelfolder'
+        source_files = self._get_files_list_in_collection(source_collection["uuid"], subfolder)
+        self.logger.debug("Getting list of files in destination collection, %s",
+                          destination_collection["uuid"])
+        destination_files = self._get_files_list_in_collection(destination_collection["uuid"])
 
         source_collection = arvados.collection.Collection(source_collection["uuid"])
         target_collection = arvados.collection.Collection(destination_collection['uuid'])
 
+        destination_paths = [
+            f"{dest_file.stream_name()}/{dest_file.name()}"
+            for dest_file in destination_files
+        ]
         for source_file in source_files:
             source_path = f"{source_file.stream_name()}/{source_file.name()}"
-            if source_path not in [f"{destination_file.stream_name()}/{destination_file.name()}"
-                                for destination_file in destination_files]:
-                target_collection.copy(source_path, target_path=source_path, source_collection=source_collection)
+            if source_path not in destination_paths:
+                # take out the leading slash if the reference file is in the collection root
+                source_path = source_path.lstrip('/')
+                target_collection.copy(
+                    source_path,
+                    target_path=source_path,
+                    source_collection=source_collection
+                )
         target_collection.save()
-
         self.logger.debug("Done copying folder.")
         return destination_collection
 
-    def copy_workflow(self, src_workflow, destination_project):
-        '''
-        Copy a workflow from one project to another, if a workflow with the same name
-        does not already exist in the destination project.
+    # @override
+    def get_files(self, project, filters=None):
+        """
+        Retrieve files in a project matching the filter criteria.
 
-        :param src_workflow: The workflow to copy
-        :param destination_project: The project to copy the workflow to
-        :return: The workflow that was copied or exists in the destination project
-        '''
-        self.logger.debug("Copying workflow %s to project %s", src_workflow, destination_project["uuid"])
-        # Get the workflow we want to copy
-        try:
-            workflow = self.api.workflows().get(uuid=src_workflow).execute()
-        except arvados.errors.ApiError:
-            self.logger.error("Source workflow %s not found", src_workflow)
-            return None
+        :param project: Project to search for files
+        :param filters: Dictionary containing filter criteria
+            {
+                'name': 'file_name',
+                'prefix': 'file_prefix',
+                'suffix': 'file_suffix',
+                'folder': 'folder_name',  # Here, a root folder is the name of the collection.
+                'recursive': True/False
+            }
+        :return: List of tuples (full_path, file_id) matching filter criteria.
+            full_path: The complete path including collection and subdirectories
+                       e.g., "/CollectionName/subdir/file.fastq.gz"
+            file_id: keep URI e.g., "keep:{uuid}/subdir/file.fastq.gz"
+        """
+        collection_filter = [["owner_uuid", "=", project["uuid"]]]
+        if filters and "folder" in filters:
+            folder = filters['folder'].lstrip('/')
+            collection_name_filter = folder.split('/')[0]
+            collection_filter.append(["name", "=", collection_name_filter])
 
-        wf_name = workflow["name"]
-        # Check if there is a git version at the end, and if so, strip it
-        result = re.search(r' \(.*\)$', wf_name)
-        # If the git hasn is present, strip it.
-        if result:
-            wf_name = wf_name[0:result.start()]
-        self.logger.debug("Source workflow name: %s", wf_name)
+        matching_collections = []
+        search_result = self.api.collections().list(filters=collection_filter).execute()
+        if len(search_result['items']) > 0:
+            matching_collections = search_result['items']
 
-        # Get the existing (if any) workflow in the destination project with the same name as the
-        # reference workflow
-        existing_workflows = self.api.workflows().list(filters=[
-            ["owner_uuid", "=", destination_project["uuid"]],
-            ["name", "like", f"{wf_name}%"]
-            ]).execute()
-        if len(existing_workflows["items"]):
-            self.logger.debug("Workflow %s already exists in project %s", wf_name, destination_project["uuid"])
-            # Return existing matching workflow
-            return existing_workflows["items"][0]
+        matching_files = []
+        for collection in matching_collections:
+            collection_name = collection['name']
+            files = self._get_files_list_in_collection(collection["uuid"])
 
-        # Workflow does not exist in project, so copy it
-        self.logger.debug("Workflow %s does not exist in project %s, copying", wf_name, destination_project["uuid"])
-        workflow['owner_uuid'] = destination_project['uuid']
-        del workflow['uuid']
-        copied_workflow = self.api.workflows().create(body=workflow).execute()
-        self.logger.debug("Copied workflow %s to project %s", wf_name, destination_project["uuid"])
-        return copied_workflow
+            for f in files:
+                internal_path = f"{f.stream_name()}/{f.name}".lstrip('./')
+                file_id = f"keep:{collection['uuid']}/{internal_path}"
+                full_path = f"/{collection_name}/{internal_path}"
 
-    def copy_workflows(self, reference_project, destination_project):
-        '''
-        Copy all workflows from the reference_project to project,
-        IF the workflow (by name) does not already exist in the project.
-        '''
-        # Get list of reference workflows
-        reference_workflows = self.api.workflows().list(filters=[
-            ["owner_uuid", "=", reference_project["uuid"]]
-            ]).execute()
-        destination_workflows = self.api.workflows().list(filters=[
-            ["owner_uuid", "=", destination_project["uuid"]]]
-            ).execute()
-        # Copy the workflow if it doesn't already exist in the destination project
-        for workflow in reference_workflows["items"]:
-            if workflow["name"] not in [workflow["name"] for workflow in destination_workflows["items"]]:
-                workflow['owner_uuid'] = destination_project["uuid"]
-                del workflow['uuid']
-                destination_workflows.append(self.api.workflows().create(body=workflow).execute())
-        return destination_workflows
+                filename = f.name
+                if filters:
+                    if 'name' in filters and filters['name'] != filename:
+                        continue
+                    if 'prefix' in filters and not filename.startswith(filters['prefix']):
+                        continue
+                    if 'suffix' in filters and not filename.endswith(filters['suffix']):
+                        continue
+                    if 'folder' in filters and filters['folder'] != os.path.dirname(full_path):
+                        continue
+                matching_files.append((full_path, file_id))
 
-    def delete_task(self, task: ArvadosTask):
-        ''' Delete a task/workflow/process '''
-        self.api.container_requests().delete(uuid=task.container_request["uuid"]).execute()
+        self.logger.debug("Return list of %d files", len(matching_files))
+        return matching_files
 
-    @classmethod
-    def detect(cls):
-        '''
-        Detect if we are running in a Arvados environment
-        '''
-        if os.environ.get('ARVADOS_API_HOST', None):
-            return True
-        return False
+    def download_file(self, file, dest_folder):
+        """
+        Download a file to a local directory
+        :param file: File to download e.g. keep:asdf-asdf-asdf/some/file.txt
+        :param dest_folder: Destination folder to download file to
+        :return: Name of local file downloaded or None
+        """
+        dest_file = os.path.join(dest_folder, os.path.basename(file))
+        collection_uuid, file_path = find_collection_file_path(file)
 
-    def get_current_task(self) -> ArvadosTask:
-        '''
-        Get the current task
-        :return: ArvadosTask object
-        '''
+        c = arvados.collection.CollectionReader(manifest_locator_or_text=collection_uuid,
+                                                api_client=self.api)
+        with c.open(file_path, "rb") as reader:
+            with open(dest_file, "wb") as writer:
+                content = reader.read(128*1024)
+                while content:
+                    writer.write(content)
+                    content = reader.read(128*1024)
+        return dest_file
 
-        try:
-            current_container = self.api.containers().current().execute()
-        except arvados.errors.ApiError as exc:
-            raise ValueError("Current task not associated with a container") from exc
-        request = self.api.container_requests().list(filters=[
-                ["container_uuid", "=", current_container["uuid"]]
-            ]).execute()
-        if 'items' in request and len(request['items']) > 0:
-            return ArvadosTask(request['items'][0], current_container)
-        raise ValueError("Current task not associated with a container")
+    def export_file(self, file, bucket_name, prefix):
+        """
+        Use platform specific functionality to copy a file from a platform to an S3 bucket.
+        :param file: File to export, keep:<collection_uuid>/<file_path>
+        :param bucket_name: S3 bucket name
+        :param prefix: Destination S3 folder to export file to, path/to/folder
+        :return: s3 file path or None
+        """
+        collection_uuid, key = find_collection_file_path(file)
+        c = arvados.collection.CollectionReader(
+            manifest_locator_or_text=collection_uuid, api_client=self.api
+        )
+        # If the file is in the keep collection
+        if key in c:
+            with c.open(key, "rb") as reader:
+                with smart_open.open(
+                    f"s3://{bucket_name}/{prefix}/{key}", "wb"
+                ) as writer:
+                    content = reader.read(128 * 1024)
+                    while content:
+                        writer.write(content)
+                        content = reader.read(128 * 1024)
 
     def get_file_id(self, project, file_path):
         '''
         Get a file id by its full path name
-        
+
         :param project: The project to search
         :param file_path: The full path of the file to search for
         :return: The file id or None if not found
         '''
-        if file_path.startswith('http') or file_path.startswith('keep'):
+        if file_path.startswith('http') or file_path.startswith('keep') or file_path.startswith('s3'):
             return file_path
 
         # Get the collection
@@ -291,8 +451,9 @@ class ArvadosPlatform(Platform):
         else:
             raise ValueError(f"Collection {collection_name} not found in project {project['uuid']}")
 
-        # Do we need to check for the file in the collection?  That could add a lot of overhead to query the collection
-        # for the file.  Lets see if this comes up before implementing it.
+        # Do we need to check for the file in the collection?
+        # That could add a lot of overhead to query the collection for the file.
+        # Lets see if this comes up before implementing it.
         return f"keep:{collection['portable_data_hash']}/{'/'.join(folder_tree[1:])}"
 
     def get_folder_id(self, project, folder_path):
@@ -316,125 +477,33 @@ class ArvadosPlatform(Platform):
             return None
         return f"keep:{collection['uuid']}/{folder_path}"
 
-    def get_task_input(self, task, input_name):
-        ''' Retrieve the input field of the task '''
-        if input_name in task.container_request['properties']['cwl_input']:
-            input_field = task.container_request['properties']['cwl_input'][input_name]
-            if 'location' in input_field:
-                return input_field['location']
-            return input_field
-        raise ValueError(f"Could not find input {input_name} in task {task.container_request['uuid']}")
-
-    def get_task_state(self, task: ArvadosTask, refresh=False):
+    def rename_file(self, fileid, new_filename):
         '''
-        Get workflow/task state
+        Rename a file to new_filename.
 
-        :param project: The project to search
-        :param task: The task to search for. Task is an ArvadosTask containing a container_request_uuid and
-            container dictionary.
-        :return: The state of the task (Queued, Running, Complete, Failed, Cancelled)
+        :param file: File ID to rename
+        :param new_filename: str of new filename
         '''
-        if refresh:
-            # On newly submitted jobs, we'll only have a container_request, uuid.
-            task.container_request = arvados.api().container_requests().get(uuid = task.container_request['uuid']).execute() # pylint: disable=line-too-long
-            task.container = arvados.api().containers().get(uuid = task.container_request['container_uuid']).execute()
+        collection_uuid = fileid.split('keep:')[1].split('/')[0]
+        filepath = fileid.split(collection_uuid+'/')[1]
+        if len(filepath.split('/'))>1:
+            newpath = '/'.join(filepath.split('/')[:-1]+[new_filename])
+        else:
+            newpath = new_filename
+        collection = arvados.collection.Collection(collection_uuid, api_client=self.api)
+        collection.copy(filepath, newpath)
+        collection.remove(filepath, recursive=True)
+        collection.save()
 
-        if task.container['exit_code'] == 0:
-            return 'Complete'
-        if task.container['exit_code'] == 1:
-            return 'Failed'
-        if task.container['state'] == 'Running':
-            return 'Running'
-        if task.container['state'] == 'Cancelled':
-            return 'Cancelled'
-        if task.container['state'] in ['Locked', 'Queued']:
-            return 'Queued'
-        raise ValueError(f"TODO: Unknown task state: {task.container['state']}")
-
-    def get_task_output(self, task: ArvadosTask, output_name):
-        ''' Retrieve the output field of the task '''
-        cwl_output = self._load_cwl_output(task)
-
-        if cwl_output.get(output_name, 'None'):
-            output_field = cwl_output[output_name]
-
-            if isinstance(output_field, list):
-                # If the output is a list, return a list of file locations
-                output_files = []
-                for output in output_field:
-                    if 'location' in output:
-                        output_file = output['location']
-                        output_files.append(f"keep:{task.container_request['output_uuid']}/{output_file}")
-                return output_files
-
-            if 'location' in output_field:
-                # If the output is a single file, return the file location
-                output_file = cwl_output[output_name]['location']
-                return f"keep:{task.container_request['output_uuid']}/{output_file}"
-
-        return None
-
-    def get_task_output_filename(self, task: ArvadosTask, output_name):
-        ''' Retrieve the output field of the task and return filename'''
-        cwl_output_collection = arvados.collection.Collection(task.container_request['output_uuid'],
-                                                              api_client=self.api,
-                                                              keep_client=self.keep_client)
-        with cwl_output_collection.open('cwl.output.json') as cwl_output_file:
-            cwl_output = json.load(cwl_output_file)
-        output_file = cwl_output[output_name]['basename']
-        return output_file
-
-    def get_tasks_by_name(self, project, task_name): # -> list(ArvadosTask):
+    def roll_file(self, project, file_name):
         '''
-        Get all processes (jobs) in a project with a specified name
+        Roll (find and rename) a file in a project.
 
-        :param project: The project to search
-        :param process_name: The name of the process to search for
-        :return: List of container request uuids and associated containers
+        :param project: The project the file is located in
+        :param file_name: The filename that needs to be rolled
         '''
-        # We must add priority>0 filter so we do not capture Cancelled jobs as Queued jobs.
-        # According to Curii, 'Cancelled' on the UI = 'Queued' with priority=0, we are not interested in Cancelled
-        # jobs here anyway, we will submit the job again
-        tasks = []
-        for container_request in arvados.util.keyset_list_all(
-            self.api.container_requests().list,
-            filters=[
-                ["name", '=', task_name],
-                ['owner_uuid', '=', project['uuid']], ['priority', '>', 0]
-            ]
-        ):
-            # Get the container
-            container = self.api.containers().get(uuid=container_request['container_uuid']).execute()
-            tasks.append(ArvadosTask(container_request, container))
-        return tasks
-
-    def get_project(self):
-        ''' Determine what project we are running in '''
-        try:
-            current_container = self.api.containers().current().execute()
-            request = self.api.container_requests().list(filters=[
-                    ["container_uuid", "=", current_container["uuid"]]
-                ]).execute()
-            return self.get_project_by_id(request["items"][0]['owner_uuid'])
-        except arvados.errors.ApiError:
-            return None
-
-    def get_project_by_name(self, project_name):
-        ''' Get a project by its name '''
-        self.logger.debug("Searching for project %s", project_name)
-        search_result = self.api.groups().list(filters=[["name", "=", project_name]]).execute()
-        if len(search_result['items']) > 0:
-            self.logger.debug("Found project %s", search_result['items'][0]['uuid'])
-            return search_result['items'][0]
-        self.logger.debug("Could not find project")
-        return None
-
-    def get_project_by_id(self, project_id):
-        ''' Get a project by its id '''
-        search_result = self.api.groups().list(filters=[["uuid", "=", project_id]]).execute()
-        if len(search_result['items']) > 0:
-            return search_result['items'][0]
-        return None
+        # Each run of a workflow will have a unique output collection, hence there will be no
+        # name conflicts.
 
     def stage_output_files(self, project, output_files):
         '''
@@ -456,13 +525,15 @@ class ArvadosPlatform(Platform):
             outputs_collection = self.api.collections().create(body={
                 "owner_uuid": project["uuid"],
                 "name": output_collection_name}).execute()
-        outputs_collection = arvados.collection.Collection(outputs_collection['uuid'], api_client=self.api)
+        outputs_collection = arvados.collection.Collection(outputs_collection['uuid'],
+                                                           api_client=self.api)
 
         with outputs_collection.open("sources.txt", "a+") as sources:
             copied_outputs = [n.strip() for n in sources.readlines()]
 
             for output_file in output_files:
-                self.logger.info("Staging output file %s -> %s", output_file['source'], output_file['destination'])
+                self.logger.info("Staging output file %s -> %s",
+                                 output_file['source'], output_file['destination'])
                 if output_file['source'] in copied_outputs:
                     continue
 
@@ -470,7 +541,8 @@ class ArvadosPlatform(Platform):
                 #keep:asdf-asdf-asdf/some/file.txt
                 source_collection_uuid = output_file['source'].split(':')[1].split('/')[0]
                 source_file = '/'.join(output_file['source'].split(':')[1].split('/')[1:])
-                source_collection = arvados.collection.Collection(source_collection_uuid, api_client=self.api)
+                source_collection = arvados.collection.Collection(source_collection_uuid,
+                                                                  api_client=self.api)
 
                 # Copy the file
                 outputs_collection.copy(source_file, target_path=output_file['destination'],
@@ -481,6 +553,507 @@ class ArvadosPlatform(Platform):
             outputs_collection.save()
         except googleapiclient.errors.HttpError as exc:
             self.logger.error("Failed to save output files: %s", exc)
+
+    def upload_file(self, filename, project, dest_folder=None, destination_filename=None,
+                    overwrite=False): # pylint: disable=too-many-arguments
+        '''
+        Upload a local file to project 
+        :param filename: filename of local file to be uploaded.
+        :param project: project that the file is uploaded to.
+        :param dest_folder: The target path to the folder that file will be uploaded to.
+        None will upload to root.
+        :param destination_filename: File name after uploaded to destination folder.
+        :param overwrite: Overwrite the file if it already exists.
+        :return: ID of uploaded file.
+        '''
+
+        if dest_folder is None:
+            self.logger.error("Must provide a collection name for Arvados file upload.")
+            return None
+
+        # trim slash at beginning and end
+        folder_tree = dest_folder.split('/')
+        try:
+            if not folder_tree[0]:
+                folder_tree = folder_tree[1:]
+            if not folder_tree[-1]:
+                folder_tree = folder_tree[:-1]
+            collection_name = folder_tree[0]
+        except IndexError:
+            self.logger.error("Must provide a collection name for Arvados file upload.")
+            return None
+
+        # Get the destination collection
+        search_result = self.api.collections().list(filters=[
+            ["owner_uuid", "=", project["uuid"]],
+            ["name", "=", collection_name]
+            ]).execute()
+        if len(search_result['items']) > 0:
+            destination_collection = search_result['items'][0]
+        else:
+            destination_collection = self.api.collections().create(body={
+                "owner_uuid": project["uuid"],
+                "name": collection_name}).execute()
+
+        target_collection = arvados.collection.Collection(destination_collection['uuid'])
+
+        if destination_filename is None:
+            destination_filename = filename.split('/')[-1]
+
+        if len(folder_tree) > 1:
+            target_filepath = '/'.join(folder_tree[1:]) + '/' + destination_filename
+        else:
+            target_filepath = destination_filename
+
+        if overwrite or target_collection.find(target_filepath) is None:
+            with open(filename, "rb") as local_file:
+                local_content = local_file.read()
+            with target_collection.open(target_filepath, 'wb') as arv_file:
+                arv_file.write(local_content) # pylint: disable=no-member
+            target_collection.save()
+        return f"keep:{destination_collection['uuid']}/{target_filepath}"
+
+    # Task/Workflow methods
+    def copy_workflow(self, src_workflow, destination_project):
+        '''
+        Copy a workflow from one project to another, if a workflow with the same name
+        does not already exist in the destination project.
+
+        :param src_workflow: The workflow to copy
+        :param destination_project: The project to copy the workflow to
+        :return: The workflow that was copied or exists in the destination project
+        '''
+        self.logger.debug("Copying workflow %s to project %s",
+                          src_workflow, destination_project["uuid"])
+        # Get the workflow we want to copy
+        try:
+            workflow = self.api.workflows().get(uuid=src_workflow).execute()
+        except arvados.errors.ApiError:
+            self.logger.error("Source workflow %s not found", src_workflow)
+            return None
+
+        wf_name = workflow["name"]
+        # Check if there is a git version at the end, and if so, strip it
+        result = re.search(r' \(.*\)$', wf_name)
+        # If the git hasn is present, strip it.
+        if result:
+            wf_name = wf_name[0:result.start()]
+        self.logger.debug("Source workflow name: %s", wf_name)
+
+        # Get the existing (if any) workflow in the destination project with the same name as the
+        # reference workflow
+        existing_workflows = self.api.workflows().list(filters=[
+            ["owner_uuid", "=", destination_project["uuid"]],
+            ["name", "like", f"{wf_name}%"]
+            ]).execute()
+        if len(existing_workflows["items"]):
+            self.logger.debug("Workflow %s already exists in project %s",
+                              wf_name, destination_project["uuid"])
+            # Return existing matching workflow
+            return existing_workflows["items"][0]
+
+        # Workflow does not exist in project, so copy it
+        self.logger.debug("Workflow %s does not exist in project %s, copying",
+                          wf_name, destination_project["uuid"])
+        workflow['owner_uuid'] = destination_project['uuid']
+        del workflow['uuid']
+        copied_workflow = self.api.workflows().create(body=workflow).execute()
+        self.logger.debug("Copied workflow %s to project %s", wf_name, destination_project["uuid"])
+        return copied_workflow
+
+    def copy_workflows(self, reference_project, destination_project):
+        '''
+        Copy all workflows from the reference_project to project,
+        IF the workflow (by name) does not already exist in the project.
+        '''
+        # Get list of reference workflows
+        reference_workflows = self.get_workflows(reference_project)
+        destination_workflows = self.get_workflows(destination_project)
+        # Copy the workflow if it doesn't already exist in the destination project
+        for workflow in reference_workflows["items"]:
+            if workflow["name"] not in [
+                workflow["name"]for workflow in destination_workflows["items"]
+            ]:
+                workflow['owner_uuid'] = destination_project["uuid"]
+                del workflow['uuid']
+                destination_workflows.append(self.api.workflows().create(body=workflow).execute())
+        return destination_workflows
+
+    def get_workflows(self, project):
+        '''
+        Get workflows in a project
+
+        :param: Platform Project
+        :return: List of workflows
+        '''
+        workflows = self.api.workflows().list(filters=[
+            ["owner_uuid", "=", project["uuid"]]
+            ]).execute()
+        return workflows["items"]
+
+    def delete_task(self, task: ArvadosTask):
+        ''' Delete a task/workflow/process '''
+        self.api.container_requests().delete(uuid=task.container_request["uuid"]).execute()
+
+    def get_current_task(self) -> ArvadosTask:
+        '''
+        Get the current task
+        :return: ArvadosTask object
+        '''
+
+        try:
+            current_container = self.api.containers().current().execute()
+        except arvados.errors.ApiError as exc:
+            raise ValueError("Current task not associated with a container") from exc
+        request = self.api.container_requests().list(filters=[
+                ["container_uuid", "=", current_container["uuid"]]
+            ]).execute()
+        if 'items' in request and len(request['items']) > 0:
+            return ArvadosTask(request['items'][0], current_container)
+        raise ValueError("Current task not associated with a container")
+
+    def get_task_cost(self, task):
+        ''' Return task cost '''
+        return task.container["cost"]
+
+    def get_task_input(self, task, input_name):
+        ''' Retrieve the input field of the task '''
+        if input_name in task.container_request['properties']['cwl_input']:
+            input_value = task.container_request['properties']['cwl_input'][input_name]
+            if isinstance(input_value, dict) and 'location' in input_value:
+                return input_value['location']
+            if (isinstance(input_value, list) and
+                all(isinstance(input, dict) and 'location' in input for input in input_value)):
+                return [input['location'] for input in input_value]
+            return input_value
+        raise ValueError(
+            f"Could not find input {input_name} in task {task.container_request['uuid']}"
+        )
+
+    def get_task_state(self, task: ArvadosTask, refresh=False):
+        '''
+        Get workflow/task state
+
+        Possible states are discussed at:
+        https://doc.arvados.org/main/api/methods/container_requests.html#:~:text=Container%20request%20lifecycle
+
+        :param task: The task to search for. Task is an ArvadosTask containing
+        a container_request_uuid and container dictionary.
+        :param refresh: If True, refresh the task state from the server
+        :return: The state of the task (Queued, Running, Complete, Failed, Cancelled)
+        '''
+        if refresh:
+            # On newly submitted jobs, we'll only have a container_request, uuid.
+            task.container_request = self.api.container_requests().get(
+                uuid = task.container_request['uuid']
+            ).execute()
+            task.container = self.api.containers().get(
+                uuid = task.container_request['container_uuid']
+                ).execute()
+
+        if task.container_request['state'] == "Uncommitted":
+            return 'Cancelled' # For consistency w/ SBG, where DRAFT state returns 'CANCELLED'
+
+        # container request state is always committed in these cases
+        if task.container is None or \
+            task.container['state'] in ['Locked', 'Queued']:
+            return 'Queued'
+        if task.container['state'] == 'Running':
+            return 'Running'
+
+        if task.container['state'] == "Complete":
+            if task.container_request['state'] == "Committed":
+                return 'Running' # task is complete but outputs not yet available
+            if task.container_request['state'] == "Final":
+                if task.container['exit_code'] == 0:
+                    return 'Complete'
+                if task.container['exit_code'] > 0:
+                    return 'Failed'
+
+        if task.container['state'] == 'Cancelled':
+            return 'Cancelled'
+
+        raise ValueError(
+            f"Unknown task state: Container request state is {task.container_request['state']}, \
+            container state is {task.container['state']}"
+        )
+
+    def get_task_output(self, task: ArvadosTask, output_name):
+        ''' Retrieve the output field of the task '''
+        cwl_output = self._load_cwl_output(task)
+
+        if cwl_output is None:
+            return None
+        if not output_name in cwl_output:
+            return None
+
+        output_field = cwl_output[output_name]
+
+        if output_field is None:
+            return None
+
+        if isinstance(output_field, list):
+            # If the output is a list, return a list of file locations
+            output_files = []
+            for output in output_field:
+                if output and 'location' in output:
+                    output_file = output['location']
+                    output_files.append(
+                        f"keep:{task.container_request['output_uuid']}/{output_file}"
+                        )
+            return output_files
+
+        if isinstance(output_field, dict):
+            if 'location' in output_field:
+                # If the output is a single file, return the file location
+                output_file = output_field['location']
+                return f"keep:{task.container_request['output_uuid']}/{output_file}"
+            return None
+
+        # Non-File scalar output (e.g. a float contamination fraction) -> return as-is,
+        # matching SevenBridgesPlatform.get_task_output.
+        return output_field
+
+    def get_task_outputs(self, task):
+        ''' Return a list of output fields of the task '''
+        cwl_output = self._load_cwl_output(task)
+        return list(cwl_output.keys())
+
+    def get_task_output_filename(self, task: ArvadosTask, output_name):
+        '''
+        Retrieve the output field of the task and return filename
+        NOTE: This method is deprecated as of v0.2.5 of PAML.  Will be removed in v1.0.
+        '''
+        self.logger.warning(
+            "get_task_output_filename to be DEPRECATED (as of v0.2.5),use get_task_output instead."
+        )
+        cwl_output_collection = arvados.collection.Collection(task.container_request['output_uuid'],
+                                                              api_client=self.api,
+                                                              keep_client=self.keep_client)
+        with cwl_output_collection.open('cwl.output.json') as cwl_output_file:
+            cwl_output = json.load(cwl_output_file)
+        if output_name in cwl_output:
+            if isinstance(cwl_output[output_name], list):
+                return [output['basename'] for output in cwl_output[output_name]]
+            if isinstance(cwl_output[output_name], dict):
+                return cwl_output[output_name]['basename']
+        raise ValueError(
+            f"Output {output_name} does not exist for task {task.container_request['uuid']}."
+        )
+
+    def get_tasks_by_name(self,
+                          project:dict,
+                          task_name:str=None,
+                          workflow:str=None,
+                          inputs_to_compare:dict=None,
+                          tasks:List[ArvadosTask]=None) -> List[ArvadosTask]:
+        '''
+        Get all processes/tasks in a project with a specified name, or all
+        tasks if no name is specified. Optionally, compare task inputs to
+        ensure equivalency (eg for reuse).
+        :param project: The project to search
+        :param task_name: The name of the process to search for
+            (if None return all tasks)
+        :param workflow: The workflow the task must have run to match, as the
+            {'uuid': ...} dict passed to submit_task (or a bare uuid). If None,
+            match tasks of any workflow. Tasks whose source workflow cannot be
+            determined are not excluded.
+        :param inputs_to_compare: Inputs to compare to ensure task equivalency
+        :param tasks: List of tasks to search in
+            (if None, query all tasks in project)
+        :return: List of tasks
+        '''
+        # Fetch tasks if not provided
+        if tasks is None:
+            # Filter out cancelled jobs (priority=0)
+            filters = [
+                ['owner_uuid', '=', project['uuid']],
+                ['priority', '>', 0]
+            ]
+
+            # Add name filter if specified
+            if task_name:
+                filters.append(["name", '=', task_name])
+
+            container_requests = arvados.util.keyset_list_all(
+                self.api.container_requests().list, filters=filters
+            )
+        else:
+            # Use provided tasks
+            container_requests = [task.container_request for task in tasks]
+
+        matching_tasks = []
+
+        for container_request in container_requests:
+            # Skip if name doesn't match (when task_name is specified)
+            if task_name and container_request['name'] != task_name:
+                continue
+
+            # Skip is container_request does not have a container_uuid
+            # in the case a task was cancelled or never executed?
+            if container_request['container_uuid'] is None:
+                continue
+
+            # Only reuse a task that ran the requested workflow, so a same-named
+            # task from another pipeline is not mistaken for this one.
+            if workflow is not None and not self._container_request_matches_workflow(
+                container_request, workflow
+            ):
+                continue
+
+            # Get the container
+            container = self.api.containers().get(
+                uuid=container_request['container_uuid']
+            ).execute()
+            task = ArvadosTask(container_request, container)
+
+            # If no input comparison needed, add task to results
+            if inputs_to_compare is None:
+                matching_tasks.append(task)
+                continue
+
+            # Get task inputs from either properties or mounts
+            task_inputs = self._get_task_inputs(container_request, container)
+            if not task_inputs:
+                self.logger.debug(
+                    "Task %s has no cwl_input property",
+                    container_request['uuid']
+                )
+                continue
+
+            # Check if inputs match
+            if self._inputs_match(
+                task_inputs, inputs_to_compare, container_request['uuid']
+            ):
+                self.logger.debug(
+                    "Task %s matches inputs", container_request['uuid'])
+                matching_tasks.append(task)
+
+        return matching_tasks
+
+    def _container_request_matches_workflow(self, container_request, workflow):
+        '''
+        Return True if the container request was launched from the given workflow.
+        arvados-cwl-runner records the source workflow uuid in the container
+        request's properties (template_uuid). If it cannot be determined, do not
+        exclude the task (return True) so this never removes a task we cannot
+        positively rule out.
+
+        :param container_request: The container request to check
+        :param workflow: The workflow {'uuid': ...} dict (or a bare uuid string)
+        :return: True if it matches or cannot be determined, False otherwise
+        '''
+        workflow_uuid = workflow.get('uuid') if isinstance(workflow, dict) else workflow
+        if not workflow_uuid:
+            return True
+        properties = container_request.get('properties') or {}
+        task_workflow_uuid = properties.get('template_uuid')
+        if not task_workflow_uuid:
+            # Source workflow unknown; do not exclude.
+            return True
+        return task_workflow_uuid == workflow_uuid
+
+    def _get_task_inputs(self, container_request, container):
+        """
+        Extract task inputs from container request or container
+
+        :param container_request: The container request object
+        :param container: The container object
+        :return: Task inputs or None if not found
+        """
+        if 'properties' in container_request and 'cwl_input' in container_request['properties']:
+            return container_request['properties']['cwl_input']
+
+        if 'mounts' in container and '/var/lib/cwl/cwl.input.json' in container['mounts']:
+            return container['mounts']['/var/lib/cwl/cwl.input.json']['content']
+
+        return None
+
+    def _inputs_match(self, task_inputs, inputs_to_compare, task_uuid):
+        """
+        Check if task inputs match the inputs to compare
+
+        :param task_inputs: The task inputs
+        :param inputs_to_compare: The inputs to compare against
+        :param task_uuid: Task UUID for logging
+        :return: True if inputs match, False otherwise
+        """
+        for input_name, input_value in inputs_to_compare.items():
+            if input_name not in task_inputs:
+                self.logger.debug("Input %s not found in task %s", input_name, task_uuid)
+                return False
+
+            if not self._compare_inputs(task_inputs[input_name], input_value):
+                self.logger.debug("Task %s input %s does not match: %s vs query %s",
+                                task_uuid, input_name, task_inputs[input_name], input_value)
+                return False
+
+        return True
+
+    def _compare_inputs(self, task_input, input_to_compare):
+        """
+        Compare a task input to an input to compare.
+        File and Directory locations are compared without their presigned-URL
+        signature, so a re-signed URL for the same object still matches.
+        :param task_input: The task input to compare
+        :param input_to_compare: The input to compare against
+        :return: True if the inputs match, False otherwise
+        """
+        # If the inputs are dictionaries, compare them recursively
+        if isinstance(task_input, dict) and isinstance(input_to_compare, dict):
+            # For File objects, compare the location/path
+            if 'class' in input_to_compare and input_to_compare['class'] == 'File':
+                if 'location' in task_input and 'path' in input_to_compare:
+                    return (_normalize_location(task_input['location']) ==
+                            _normalize_location(input_to_compare['path']))
+                return False
+
+            # For Directory objects, compare the location/path and listing if available
+            if 'class' in input_to_compare and input_to_compare['class'] == 'Directory':
+                if 'location' in task_input and 'path' in input_to_compare:
+                    if (_normalize_location(task_input['location']) !=
+                            _normalize_location(input_to_compare['path'])):
+                        return False
+
+                    # If listing is available, compare it
+                    if 'listing' in task_input and 'listing' in input_to_compare:
+                        if len(task_input['listing']) != len(input_to_compare['listing']):
+                            return False
+
+                        # Compare each item in the listing
+                        for task_item, compare_item in zip(
+                            task_input['listing'], input_to_compare['listing']
+                            ):
+                            if not self._compare_inputs(task_item, compare_item):
+                                return False
+
+                        return True
+                return False
+
+            # For other dictionaries, check if both dictionaries have the same keys
+            # and the same values for those keys
+            if set(task_input.keys()) != set(input_to_compare.keys()):
+                return False
+
+            # Now check that all values match
+            for key, value in input_to_compare.items():
+                if not self._compare_inputs(task_input[key], value):
+                    return False
+            return True
+
+        # If the inputs are lists, compare them item by item
+        if isinstance(task_input, list) and isinstance(input_to_compare, list):
+            if len(task_input) != len(input_to_compare):
+                return False
+
+            # Compare each item in the list
+            for task_item, compare_item in zip(task_input, input_to_compare):
+                if not self._compare_inputs(task_item, compare_item):
+                    return False
+            return True
+
+        # For simple values, compare them directly
+        return task_input == input_to_compare
 
     def stage_task_output(self, task, project, output_to_export, output_directory_name):
         '''
@@ -534,23 +1107,42 @@ class ArvadosPlatform(Platform):
                             source_collection=source_collection, overwrite=True)
         outputs_collection.save()
 
-    def submit_task(self, name, project, workflow, parameters, executing_settings=None):
-        ''' Submit a workflow on the platform '''
+    def submit_task(self, name, project, workflow, parameters, execution_settings=None):
+        '''
+        Submit a workflow on the platform
+        :param name: Name of the task to submit
+        :param project: Project to submit the task to
+        :param workflow: Workflow to submit
+        :param parameters: Parameters for the workflow
+        :param execution_settings: Optional dict of execution hints. Reads
+            use_spot_instance (default True), which selects
+            --enable-preemptible or --disable-preemptible, and priority
+            (default 500, clamped to 500 if outside 0-1000). Other keys are
+            ignored.
+        :return: Task object or None
+        '''
         with tempfile.NamedTemporaryFile() as parameter_file:
             with open(parameter_file.name, mode='w', encoding="utf-8") as fout:
                 json.dump(parameters, fout)
 
-            use_spot_instance = executing_settings.get('use_spot_instance', True) if executing_settings else True
+            use_spot_instance = execution_settings.get(
+                'use_spot_instance', True) if execution_settings else True
             if use_spot_instance:
                 cmd_spot_instance = "--enable-preemptible"
             else:
                 cmd_spot_instance = "--disable-preemptible"
+            priority = execution_settings.get(
+                'priority', 500) if execution_settings else 500
+            if priority < 0 or priority > 1000:
+                priority=500
 
             cmd_str = ['arvados-cwl-runner', '--no-wait',
                     '--defer-download',
                     '--varying-url-params=AWSAccessKeyId,Signature,Expires',
                     '--prefer-cached-downloads',
                     '--debug',
+                    '--priority', str(priority),
+                    '--intermediate-output-ttl', '172800',
                     cmd_spot_instance,
                     '--project-uuid', project['uuid'],
                     '--name', name,
@@ -561,7 +1153,7 @@ class ArvadosPlatform(Platform):
                 runner_out = subprocess.check_output(cmd_str, stderr = subprocess.STDOUT)
                 runner_log = runner_out.decode("UTF-8")
                 container_request_uuid = list(filter(None, runner_log.split("\n")))[-1]
-                return ArvadosTask({'uuid': container_request_uuid}, None)
+                return ArvadosTask({'name': name, 'uuid': container_request_uuid}, None)
             except subprocess.CalledProcessError as err:
                 self.logger.error("ERROR LOG: %s", str(err))
                 self.logger.error("ERROR LOG: %s", err.output)
@@ -569,59 +1161,181 @@ class ArvadosPlatform(Platform):
                 self.logger.error("ERROR LOG: %s", str(err))
         return None
 
-    def upload_file_to_project(self, filename, project, dest_folder, destination_filename=None, overwrite=False): # pylint: disable=too-many-arguments
+    ### Project methods
+    def create_project(self, project_name, project_description, **kwargs):
         '''
-        Upload a local file to project 
-        :param filename: filename of local file to be uploaded.
-        :param project: project that the file is uploaded to.
-        :param dest_folder: The target path to the folder that file will be uploaded to. None will upload to root.
-        :param destination_filename: File name after uploaded to destination folder.
-        :param overwrite: Overwrite the file if it already exists.
-        :return: ID of uploaded file.
+        Create a project
+        
+        :param project_name: Name of the project
+        :param project_description: Description of the project
+        :param kwargs: Additional arguments for creating a project
+        :return: Project object
         '''
+        arvados_user = self.api.users().current().execute()
+        project = self.api.groups().create(body={"owner_uuid": f'{arvados_user["uuid"]}',
+                                                 "name": project_name,
+                                                 "description": project_description,
+                                                 "properties": {
+                                                     "proj_owner": arvados_user["username"]
+                                                 },
+                                                 "group_class": "project"}
+                                           ).execute()
+        return project
 
-        if dest_folder is None:
-            self.logger.error("Must provide a collection name for Arvados file upload.")
-            return None
+    def delete_project_by_name(self, project_name):
+        '''
+        Delete a project on the platform 
+        '''
+        project = self.get_project_by_name(project_name)
+        if project:
+            self.api.groups().delete(uuid=project['uuid']).execute()
 
-        # trim slash at beginning and end
-        folder_tree = dest_folder.split('/')
+    def get_project(self):
+        ''' Determine what project we are running in '''
         try:
-            if not folder_tree[0]:
-                folder_tree = folder_tree[1:]
-            if not folder_tree[-1]:
-                folder_tree = folder_tree[:-1]
-            collection_name = folder_tree[0]
-        except IndexError:
-            self.logger.error("Must provide a collection name for Arvados file upload.")
+            current_container = self.api.containers().current().execute()
+            request = self.api.container_requests().list(filters=[
+                    ["container_uuid", "=", current_container["uuid"]]
+                ]).execute()
+            return self.get_project_by_id(request["items"][0]['owner_uuid'])
+        except arvados.errors.ApiError:
             return None
 
-        # Get the destination collection
-        search_result = self.api.collections().list(filters=[
-            ["owner_uuid", "=", project["uuid"]],
-            ["name", "=", collection_name]
-            ]).execute()
+    def get_project_by_name(self, project_name):
+        ''' Get a project by its name '''
+        self.logger.debug("Searching for project %s", project_name)
+        search_result = self.api.groups().list(filters=[["name", "=", project_name]]).execute()
         if len(search_result['items']) > 0:
-            destination_collection = search_result['items'][0]
+            self.logger.debug("Found project %s", search_result['items'][0]['uuid'])
+            return search_result['items'][0]
+        self.logger.debug("Could not find project")
+        return None
+
+    def get_project_by_id(self, project_id):
+        ''' Get a project by its id '''
+        search_result = self.api.groups().list(filters=[["uuid", "=", project_id]]).execute()
+        if len(search_result['items']) > 0:
+            return search_result['items'][0]
+        return None
+
+    def get_project_cost(self, project):
+        setup_filters=[
+            ['owner_uuid', '=', project['uuid']],
+            ['requesting_container_uuid', '=', None]
+        ]
+
+        cost = 0.0
+        for container_request in arvados.util.keyset_list_all(
+            self.api.container_requests().list,
+            filters=setup_filters,
+            select=["cumulative_cost"]
+        ):
+            cost += container_request["cumulative_cost"]
+        return cost
+
+    def get_project_users(self, project):
+        ''' Return a list of user objects associated with a project '''
+        users = []
+        links = self.api.links().list(
+            filters=[
+                ["head_uuid", "=", project['uuid']]
+            ]).execute()
+        for link in links['items']:
+            users.append(
+                self.api.users().list(filters=[
+                    ["uuid", "=", link['tail_uuid']]
+                ]).execute()["items"][0]
+            )
+        return users
+
+    def get_projects(self):
+        '''
+        Get list of all projects
+        '''
+        all_projects = arvados.util.keyset_list_all(
+            self.api.groups().contents,
+            filters=[
+                    ['uuid', 'is_a', 'arvados#group'],
+                    ['group_class', '=', 'project'],
+                ],
+            # Pass recursive=True to include results from subprojects in the listing.
+            recursive=False,
+            # Pass include_trash=True to include objects in the listing whose
+            # trashed_at time is passed.
+            include_trash=False
+        )
+        return list(all_projects)
+
+    ### User Methods
+    def get_current_user(self):
+        """
+        Get the currently authenticated user's profile information.
+
+        :return: Dictionary with user info: {'username': str, 'first_name': str,
+                 'last_name': str, 'email': str} or None if unavailable
+        """
+        try:
+            user = self.api.users().current().execute()
+            return {
+                'username': user.get('username', ''),
+                'first_name': user.get('first_name', ''),
+                'last_name': user.get('last_name', ''),
+                'email': user.get('email', ''),
+            }
+        # Deliberately broad: the documented contract is to return None whenever
+        # the user cannot be retrieved, and googleapiclient surfaces auth,
+        # network and TLS failures as unrelated exception types.
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            self.logger.debug("Could not retrieve current user: %s", err)
+            return None
+
+    def add_user_to_project(self, platform_user, project, permission):
+        """
+        Add a user to a project on the platform
+        :param platform_user: platform user (from get_user)
+        :param project: platform project
+        :param permission: permission (permission="read|write|execute|admin")
+        """
+        a_permission = 'can_manage' if permission=="admin" \
+            else 'can_write' if permission=="write" \
+            else 'can_read'
+        self.api.links().create(body={"link": {
+                                            "link_class": "permission",
+                                            "name": a_permission,
+                                            "tail_uuid": platform_user['uuid'],
+                                            "head_uuid": project['uuid']
+                                       }
+                                     }
+                                ).execute()
+
+    def get_user(self, user):
+        """
+        Get a user object from their (platform) user id or email address
+
+        :param user: user id or email address
+        :return: User object or None
+        """
+        if '@' in user:
+            user_resp = self.api.users().list(filters=[["email","ilike",user]]).execute()
         else:
-            destination_collection = self.api.collections().create(body={
-                "owner_uuid": project["uuid"],
-                "name": collection_name}).execute()
+            user_resp = self.api.users().list(filters=[["username","ilike",user]]).execute()
+        if len(user_resp['items']) > 0:
+            return user_resp["items"][0]
+        return None
 
-        target_collection = arvados.collection.Collection(destination_collection['uuid'])
+    # Other methods
+    def connect(self, **kwargs):
+        ''' Connect to Arvados '''
+        self.api = arvados.api_from_config(version='v1', apiconfig=self.api_config)
+        self.keep_client = arvados.KeepClient(self.api)
+        self.connected = True
+        return True
 
-        if destination_filename is None:
-            destination_filename = filename.split('/')[-1]
-
-        if len(folder_tree) > 1:
-            target_filepath = '/'.join(folder_tree[1:]) + '/' + destination_filename
-        else:
-            target_filepath = destination_filename
-
-        if overwrite or target_collection.find(target_filepath) is None:
-            with open_file_with_inferred_encoding(filename) as local_file:
-                local_content = local_file.read()
-            with target_collection.open(target_filepath, 'w') as arv_file:
-                arv_file.write(local_content) # pylint: disable=no-member
-            target_collection.save()
-        return f"keep:{destination_collection['uuid']}/{target_filepath}"
+    @classmethod
+    def detect(cls):
+        '''
+        Detect if we are running in a Arvados environment
+        '''
+        if os.environ.get('ARVADOS_API_HOST', None):
+            return True
+        return False

@@ -3,17 +3,24 @@ CWL Execution Platform Implementations
 '''
 import logging
 import os
+from importlib.metadata import PackageNotFoundError, version
 
 from .arvados_platform import ArvadosPlatform
 from .sevenbridges_platform import SevenBridgesPlatform
-#from .omics_platform import OmicsPlatform
+from .ngs360_platform import NGS360Platform
+
+try:
+    __version__ = version("cwl_platform")
+except PackageNotFoundError:  # running from a source tree without an install
+    __version__ = "unknown"
 
 # Move this for a config file
 SUPPORTED_PLATFORMS = {
     'Arvados': ArvadosPlatform,
-#    'Omics': OmicsPlatform,
-    'SevenBridges': SevenBridgesPlatform
+    'SevenBridges': SevenBridgesPlatform,
+    'NGS360': NGS360Platform
 }
+
 
 class PlatformFactory():
     ''' PlatformFactory '''
@@ -31,7 +38,8 @@ class PlatformFactory():
             if creator.detect():
                 return platform
 
-        # If we can't detect the platform, print out environment variables and raise an error
+        # If we can't detect the platform,
+        # print out environment variables and raise an error
         logging.info("Environment Variables:")
         for name, value in os.environ.items():
             logging.info("%s: %s", name, value)

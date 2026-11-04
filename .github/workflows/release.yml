@@ -5,47 +5,95 @@ on:
     # Sequence of patterns matched against refs/tags
     tags:
       - 'v*' # Push events to matching v*, i.e. v1.0, v20.15.10
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Existing tag to build a draft release for, e.g. v0.5.3. Use this to
+          re-run a release build that failed. Leave empty to validate that the
+          package builds without creating a release.
+        required: false
+        type: string
 
 jobs:
   release:
     name: Build & Publish Release 📦
     runs-on: ubuntu-latest
 
-    steps:
-    - uses: actions/checkout@v3
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: "3.x"
+    # Least privilege: only 'gh release create' needs write access.
+    permissions:
+      contents: write
 
-    - name: Install pypa/build
-      run: >-
-        python3 -m
-        pip install
-        build
-        --user
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        # A manual run builds the tag given as input; a tag push builds itself.
+        ref: ${{ inputs.tag || github.ref }}
+        # Required for two separate reasons. release_notes.py walks the tag list
+        # and commit history, and hatch-vcs derives the package version from the
+        # nearest tag - in a shallow clone with no tags it silently produces
+        # 0.1.dev1 instead of failing, which would publish a wrong version.
+        fetch-depth: 0
+    - name: Install uv
+      uses: astral-sh/setup-uv@v10.1.0
+      with:
+        enable-cache: true
+        cache-dependency-glob: "uv.lock"
+
+    # Resolves to the dispatch input, else the pushed tag, else empty. An empty
+    # TAG means this run only validates the build, so no release is created.
+    - name: Prepare environment with release version information
+      env:
+        INPUT_TAG: ${{ inputs.tag }}
+      run: |
+        if [ -n "$INPUT_TAG" ]; then
+          TAG="$INPUT_TAG"
+        elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+          TAG="${GITHUB_REF#refs/tags/}"
+        else
+          TAG=""
+          echo "No tag supplied - validating the build only, no release will be created."
+        fi
+        echo "TAG=$TAG" >> $GITHUB_ENV
+        echo "RELEASE_VERSION=${TAG#v}" >> $GITHUB_ENV
 
     - name: Build a binary wheel and a source tarball
-      run: python3 -m build
+      run: uv build --python 3.12
 
-    - name: Prepare environment with release version information
+    # The version is derived from git rather than declared, so confirm it came
+    # out as the tag being released. Catches a shallow checkout, a missing tag,
+    # or a dirty tree before any of it reaches a published release.
+    - name: Check the built version matches the tag
+      if: env.TAG != ''
       run: |
-        echo "RELEASE_VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
-        echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+        if [ ! -f "dist/cwl_platform-${RELEASE_VERSION}-py3-none-any.whl" ]; then
+          echo "::error::built artifacts do not match tag ${TAG}; expected version ${RELEASE_VERSION}"
+          ls -1 dist
+          exit 1
+        fi
+        echo "Built version matches ${TAG}"
+
+    # --only-group installs the dev group without the project or its runtime
+    # dependencies, which would otherwise drag in pycurl and require libcurl
+    # headers on this runner. Versions still come from uv.lock.
+    - name: Validate the built artifacts
+      run: uv run --only-group dev twine check dist/*
 
     - name: Generate release notes
+      if: env.TAG != ''
       run: |
-        python scripts/release_notes.py > ${{ github.workspace }}-RELEASE_NOTES.md
+        uv run --only-group dev python scripts/release_notes.py > ${{ github.workspace }}-RELEASE_NOTES.md
 
     - name: Create Release
+      if: env.TAG != ''
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: >-
         gh release create
-        --title "${{ github.ref_name }}"
+        --title "$TAG"
         --notes-file ${{ github.workspace }}-RELEASE_NOTES.md
         --draft
-        --prerelease
+        --latest
         --repo ${{ github.repository }}
-        ${{ github.ref }}
+        "$TAG"
         dist/**

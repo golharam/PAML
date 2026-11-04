@@ -1,0 +1,23 @@
+# To get started with Dependabot version updates, you'll need to specify which
+# package ecosystems to update and where the package manifests are located.
+
+version: 2
+updates:
+- package-ecosystem: "uv" # reads pyproject.toml and uv.lock
+  directory: "/" # Location of package manifests
+  schedule:
+    interval: "weekly"
+  groups:
+    # Collapse routine minor/patch bumps into a single PR to reduce noise.
+    python-minor-patch:
+      update-types:
+        - "minor"
+        - "patch"
+
+# Workflow action versions rot silently otherwise: checkout and setup-python had
+# both fallen four major versions behind before anyone noticed.
+- package-ecosystem: "github-actions"
+  directory: "/"
+  schedule:
+    interval: "weekly"
+

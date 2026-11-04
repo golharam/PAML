@@ -1,35 +1,48 @@
-name: Unit Test and Lint
+# This workflow runs the unit tests across the supported Python versions.
+# Dependencies come from uv.lock, so a failure here reproduces locally.
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python
 
-on: [push]
+name: Unit Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Fail rather than silently re-resolving if uv.lock is out of date.
+  UV_FROZEN: "1"
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
 
     steps:
-    - uses: actions/checkout@v3
-
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: "3.8"
+    - uses: actions/checkout@v7
 
     - name: Install packages
       run: |
         sudo apt-get update
         sudo apt-get install libcurl4-gnutls-dev libgnutls28-dev
 
+    - name: Install uv
+      uses: astral-sh/setup-uv@v10.1.0
+      with:
+        enable-cache: true
+        cache-dependency-glob: "uv.lock"
+
     - name: Install dependencies
-      run: |
-        pip install --upgrade pip
-        pip install -r requirements.txt
-        pip install -r requirements-dev.txt
+      run: uv sync --frozen --python ${{ matrix.python-version }}
 
     - name: Test
       run: |
-        PYTHONPATH=src coverage run --source=src -m pytest
-        coverage report
-
-    - name: Analysing the code with pylint
-      run: |
-        pylint --max-line-length=120 --ignore-imports=y --exit-zero $(git ls-files '*.py')
+        uv run coverage run --source=src -m pytest -v --log-cli-level=INFO
+        uv run coverage report

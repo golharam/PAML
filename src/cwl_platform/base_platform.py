@@ -2,6 +2,7 @@
 from abc import ABC, abstractmethod
 import logging
 
+
 class Platform(ABC):
     ''' abstract Platform class '''
     def __init__(self, name):
@@ -9,14 +10,112 @@ class Platform(ABC):
         self.name = name
         self.connected = False
 
+    # File methods
     @abstractmethod
-    def connect(self, **kwargs):
-        ''' Connect to the platform '''
+    def copy_file(self, file, destination_project, file_path=None):
+        """
+        Copy a single file from one project to another.
+
+        :param file: The file ID to copy (as returned in get_files tuples)
+        :param destination_project: The destination project to copy the file to
+        :param file_path: Optional destination folder path in the destination project
+        :return: The file ID of the copied file in the destination project
+        """
 
     @abstractmethod
     def copy_folder(self, source_project, source_folder, destination_project):
         ''' Copy source folder to destination project '''
 
+    @abstractmethod
+    def download_file(self, file, dest_folder):
+        """
+        Download a file to a local directory
+        :param fileid: File to download
+        :param dest_folder: Destination folder to download file to
+        :return: Name of local file downloaded or None
+        """
+
+    @abstractmethod
+    def export_file(self, file, bucket_name, prefix):
+        """
+        Use platform specific functionality to copy a file from a platform to an S3 bucket.
+        :param file: File to export
+        :param bucket_name: S3 bucket name
+        :param prefix: Destination S3 folder to export file to, path/to/folder
+        :return: s3 file path or None
+        """
+
+    @abstractmethod
+    def get_file_id(self, project, file_path):
+        ''' Get a file id by its full path name '''
+
+    @abstractmethod
+    def get_files(self, project, filters=None):
+        """
+        Retrieve files in a project matching the filter criteria
+
+        :param project: Project to search for files
+        :param filters: Dictionary containing filter criteria
+            {
+                'name': 'file_name',
+                'prefix': 'file_prefix',
+                'suffix': 'file_suffix',
+                'folder': 'folder_name',
+                'recursive': True/False
+            }
+        :return: List of tuples (full_path, file_ref) matching filter criteria.
+            full_path: The complete path including subdirectories
+                       e.g., "/inputs/run1/sample1/file1.fastq.gz"
+            file_ref: Platform-native file reference
+        """
+
+    @abstractmethod
+    def get_folder_id(self, project, folder_path):
+        ''' Get a folder id by its full path name '''
+
+    @abstractmethod
+    def rename_file(self, fileid, new_filename):
+        '''
+        Rename a file to new_filename.
+
+        :param file: File ID to rename
+        :param new_filename: str of new filename
+        '''
+
+    @abstractmethod
+    def roll_file(self, project, file_name):
+        '''
+        Roll (find and rename) a file in a project.
+
+        :param project: The project the file is located in
+        :param file_name: The filename that needs to be rolled
+        '''
+
+    @abstractmethod
+    def stage_output_files(self, project, output_files):
+        '''
+        Stage output files to a project
+
+        :param project: The project to stage files to
+        :param output_files: A list of output files to stage
+        :return: None
+        '''
+
+    @abstractmethod
+    def upload_file(self, filename, project, dest_folder=None, destination_filename=None,
+                    overwrite=False):
+        '''
+        Upload a local file to project 
+        :param filename: filename of local file to be uploaded.
+        :param project: project that the file is uploaded to.
+        :param dest_folder: The target path to the folder that file will be uploaded to.
+        None will upload to root.
+        :param destination_filename: File name after uploaded to destination folder.
+        :param overwrite: Overwrite the file if it already exists.
+        :return: ID of uploaded file.
+        '''
+
+    # Task/Workflow methods
     @abstractmethod
     def copy_workflow(self, src_workflow, destination_project):
         '''
@@ -40,24 +139,25 @@ class Platform(ABC):
         '''
 
     @abstractmethod
+    def get_workflows(self, project):
+        '''
+        Get workflows in a project
+
+        :param: Platform Project
+        :return: List of workflows
+        '''
+
+    @abstractmethod
     def delete_task(self, task):
         ''' Delete a task/workflow/process '''
-
-    @classmethod
-    def detect(cls):
-        ''' Detect platform we are running on '''
 
     @abstractmethod
     def get_current_task(self):
         ''' Get the current task '''
 
     @abstractmethod
-    def get_file_id(self, project, file_path):
-        ''' Get a file id by its full path name '''
-
-    @abstractmethod
-    def get_folder_id(self, project, folder_path):
-        ''' Get a folder id by its full path name '''
+    def get_task_cost(self, task):
+        ''' Return task cost '''
 
     @abstractmethod
     def get_task_input(self, task, input_name):
@@ -79,37 +179,31 @@ class Platform(ABC):
         ''' Retrieve the output field of the task '''
 
     @abstractmethod
+    def get_task_outputs(self, task):
+        ''' Return a list of output fields of the task '''
+
+    @abstractmethod
     def get_task_output_filename(self, task, output_name):
-        ''' Retrieve the output field of the task and return filename'''
-
-    @abstractmethod
-    def get_tasks_by_name(self, project, task_name):
-        ''' Get a tasks by its name '''
-
-    @abstractmethod
-    def get_project(self):
-        ''' Determine what project we are running in '''
-
-    @abstractmethod
-    def get_project_by_name(self, project_name):
-        ''' Get a project by its name '''
-
-    @abstractmethod
-    def get_project_by_id(self, project_id):
-        ''' Get a project by its id '''
-
-    def set_logger(self, logger):
-        ''' Set the logger '''
-        self.logger = logger
-
-    @abstractmethod
-    def stage_output_files(self, project, output_files):
         '''
-        Stage output files to a project
+        Retrieve the output field of the task and return filename
+        NOTE: This method is deprecated as of v0.2.5 of PAML.  Will be removed in v1.0.
+        '''
 
-        :param project: The project to stage files to
-        :param output_files: A list of output files to stage
-        :return: None
+    @abstractmethod
+    def get_tasks_by_name(
+        self, project:str, task_name:str=None, workflow:str=None, inputs_to_compare:dict=None, tasks:list=None
+    ):
+        '''
+        Get all processes/tasks in a project with a specified name, or all tasks
+        if no name is specified. Optionally, compare task inputs to ensure
+        equivalency (eg for reuse).
+        
+        :param project: The project to search
+        :param task_name: The name of the process to search for (if None return all tasks)
+        :param workflow: The workflow to search for (if None, search all workflows in project)
+        :param inputs_to_compare: Inputs to compare to ensure task equivalency
+        :param tasks: List of tasks to search in (if None, query all tasks in project)
+        :return: List of tasks
         '''
 
     @abstractmethod
@@ -131,24 +225,106 @@ class Platform(ABC):
         '''
 
     @abstractmethod
-    def submit_task(self, name, project, workflow, parameters, executing_settings=None):
+    def submit_task(self, name, project, workflow, parameters, execution_settings=None):
         '''
         Submit a workflow on the platform
         :param name: Name of the task to submit
         :param project: Project to submit the task to
         :param workflow: Workflow to submit
         :param parameters: Parameters for the workflow
-        :param executing_settings: {use_spot_instance: True/False}
+        :param execution_settings: Optional dict of platform-specific execution
+            hints. Keys a platform does not recognise are ignored, so a
+            cross-platform launcher can pass the union of what it needs. No key
+            is honoured by every platform - see each implementation for the ones
+            it reads:
+              * Arvados: use_spot_instance (default True), priority (default 500)
+              * SevenBridges: use_spot_instance (default True)
+              * NGS360: WES workflow engine parameters; use_spot_instance is
+                ignored
+        :return: Task object or None
+        '''
+
+    # Project methods
+    @abstractmethod
+    def create_project(self, project_name, project_description, **kwargs):
+        '''
+        Create a project
+        
+        :param project_name: Name of the project
+        :param project_description: Description of the project
+        :param kwargs: Additional arguments for creating a project
+        :return: Project object
         '''
 
     @abstractmethod
-    def upload_file_to_project(self, filename, project, dest_folder, destination_filename=None, overwrite=False): # pylint: disable=too-many-arguments
+    def delete_project_by_name(self, project_name):
         '''
-        Upload a local file to project 
-        :param filename: filename of local file to be uploaded.
-        :param project: project that the file is uploaded to.
-        :param dest_folder: The target path to the folder that file will be uploaded to. None will upload to root.
-        :param destination_filename: File name after uploaded to destination folder.
-        :param overwrite: Overwrite the file if it already exists.
-        :return: ID of uploaded file.
+        Delete a project on the platform 
         '''
+
+    @abstractmethod
+    def get_project(self):
+        ''' Determine what project we are running in '''
+
+    @abstractmethod
+    def get_project_by_name(self, project_name):
+        ''' Get a project by its name '''
+
+    @abstractmethod
+    def get_project_by_id(self, project_id):
+        ''' Get a project by its id '''
+
+    @abstractmethod
+    def get_project_cost(self, project):
+        ''' Return project cost '''
+
+    @abstractmethod
+    def get_project_users(self, project):
+        ''' Return a list of user objects associated with a project '''
+
+    @abstractmethod
+    def get_projects(self):
+        ''' Get list of all projects '''
+
+    # User methods
+    @abstractmethod
+    def add_user_to_project(self, platform_user, project, permission):
+        """
+        Add a user to a project on the platform
+        :param platform_user: platform user (from get_user)
+        :param project: platform project
+        :param permission: permission (permission="read|write|execute|admin")
+        """
+
+    @abstractmethod
+    def get_current_user(self):
+        """
+        Get the currently authenticated user's profile information.
+
+        :return: Dictionary with user info: {'username': str, 'first_name': str,
+                 'last_name': str, 'email': str} or None if unavailable
+        """
+
+    @abstractmethod
+    def get_user(self, user):
+        """
+        Get a user object from their (platform) user id or email address
+
+        :param user: user id or email address
+        :return: User object or None
+        """
+
+    # Other methods
+    @abstractmethod
+    def connect(self, **kwargs) -> bool:
+        ''' Connect to the platform '''
+        return False
+
+    @classmethod
+    def detect(cls) -> bool:
+        ''' Detect platform we are running on '''
+        return False
+
+    def set_logger(self, logger):
+        ''' Set the logger '''
+        self.logger = logger
